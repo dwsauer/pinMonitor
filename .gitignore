@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+*.elf
+*.map
+*.bin
+*.hex
+
+# ESP-IDF specific
+sdkconfig.old
+sdkconfig.defaults
+.output/
+
+# VS Code settings
+.vscode/
+*.code-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
