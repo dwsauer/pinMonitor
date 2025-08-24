@@ -1,3 +1,35 @@
+/**
+ * @file main.c
+ * @brief PinMonitor application for ESP32 with Wi-Fi and MQTT integration.
+ *
+ * This application monitors GPIO pins with debounce logic and publishes pin events to an MQTT broker.
+ * It initializes Wi-Fi in station mode, connects to a specified network, and starts an MQTT client.
+ * GPIO pins are configured with interrupt and debounce handling, and their state changes are sent as MQTT messages.
+ *
+ * Features:
+ * - Wi-Fi initialization and connection management.
+ * - MQTT client setup and event publishing.
+ * - GPIO pin monitoring with configurable debounce logic.
+ * - Task-based event handling using FreeRTOS.
+ *
+ * Modules Used:
+ * - ESP-IDF Wi-Fi, MQTT, GPIO, FreeRTOS, and timer APIs.
+ * - Custom debounce and Wi-Fi manager modules.
+ *
+ * Configuration:
+ * - Wi-Fi SSID and password are hardcoded for demonstration.
+ * - MQTT broker URI, username, and password are hardcoded.
+ * - GPIO pins and debounce parameters are configurable.
+ *
+ * Usage:
+ * - Deploy on ESP32 hardware.
+ * - Ensure network and MQTT broker availability.
+ * - Monitor MQTT topic for pin events.
+ *
+ * @author David Sauer
+ * @date 8/18/2025
+ */
+
 // Git test 8/18/2025 1620
 
 #include <stdio.h>
@@ -14,6 +46,8 @@
 #include "esp_timer.h"
 #include "debounce.h"
 #include "wifi_manager.h"
+#include "wifi_provisioning.h"
+#include "main_priv.h"
 
 
 static EventGroupHandle_t wifi_event_group;
@@ -21,24 +55,61 @@ static const char *TAG = "PinMonitor";
 static QueueHandle_t gpio_event_queue = NULL;
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
+void mqtt_app_start(void);
+void pin_monitor_init(void);
+void gpio_task(void *arg);
+
 #define WIFI_CONNECTED_BIT BIT0
 #define GPIO_INPUT_PIN GPIO_NUM_4
 #define ESP_INTR_FLAG_DEFAULT 0
 #define DEBOUNCE_TIME_US 50000  // 50 ms
 
+
+// Dummy implementation to resolve implicit declaration error.
+// Replace with your actual pin monitor initialization logic.
+void pin_monitor_init(void) {
+    debounce_init();
+
+    gpio_event_queue = xQueueCreate(10, sizeof(uint32_t));
+    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 10, NULL);
+
+    debounce_config_t pin4_cfg = {
+        .pin = GPIO_NUM_4,
+        .intr_type = GPIO_INTR_POSEDGE,
+        .pull_up = true,
+        .debounce_time_us = 50000,
+        .mqtt_topic = "/pinMonitor/gpio4"
+    };
+    debounce_register_pin(&pin4_cfg);
+
+    debounce_config_t pin5_cfg = {
+        .pin = GPIO_NUM_5,
+        .intr_type = GPIO_INTR_NEGEDGE,
+        .pull_up = true,
+        .debounce_time_us = 75000,
+        .mqtt_topic = "/pinMonitor/gpio5"
+    };
+    debounce_register_pin(&pin5_cfg);
+}
+
+/// @brief debounce_entry_t is a structure that represents a debounce entry, containing a GPIO pin (gpio_num_t pin)
+/// and an associated timer (esp_timer_handle_t timer). It is used to manage debouncing logic for input
+/// signals in embedded systems.
 typedef struct {
     gpio_num_t pin;
     esp_timer_handle_t timer;
 } debounce_entry_t;
 
-/*
+/// @brief The on_wifi_state_change function is a static callback that handles changes in Wi-Fi state. 
+/// When the state is WIFI_STATE_CONNECTED, it initializes the MQTT connection and starts monitoring pin 
+/// states with interrupt service routine (ISR) and debounce logic.
+/// @param state 
 static void on_wifi_state_change(wifi_state_t state) {
     if (state == WIFI_STATE_CONNECTED) {
-        start_mqtt();         // Your MQTT init
-        start_pin_monitor();  // Your ISR + debounce logic
+        mqtt_app_start();     // Your MQTT init
+        pin_monitor_init();   // Your ISR + debounce logic
     }
 }
-*/
 
 /// @brief 
 /// The wifi_event_handler function is a static event handler that processes Wi-Fi and
@@ -61,11 +132,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 /// @brief 
-/// The wifi_init_sta function initializes and configures the Wi-Fi station mode on an
+/// The wifi_init_sta_ext function initializes and configures the Wi-Fi station mode on an
 /// ESP32 device. It sets up the necessary event handlers, creates a Wi-Fi configuration
-/// with predefined SSID and password, starts the Wi-Fi, and waits for a successful connection.
-/// @param  
-void wifi_init_sta(void) {
+/// using SSID and password stored in NVS (Non-Volatile Storage), starts the Wi-Fi, and waits
+/// for a successful connection.
+/// @param  none
+void wifi_init_sta_ext(void) {
     wifi_event_group = xEventGroupCreate();
 
     esp_netif_init();
@@ -78,24 +150,50 @@ void wifi_init_sta(void) {
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = "Mahogany",
-            .password = "je1q-ynby-7l24",
-        }
-    };
+    // Read SSID and password from NVS
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS handle: %s", esp_err_to_name(err));
+        return;
+    }
+
+    char ssid[32] = {0};
+    char password[64] = {0};
+    size_t ssid_len = sizeof(ssid);
+    size_t password_len = sizeof(password);
+
+    err = nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SSID not found in NVS: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    err = nvs_get_str(nvs_handle, "password", password, &password_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Password not found in NVS: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    nvs_close(nvs_handle);
+
+    wifi_config_t wifi_config = { 0 };
+    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
 
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_err_t err = esp_wifi_start();
+    err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start WiFi: %s", esp_err_to_name(err));
         return;
-    };
+    }
 
     // Wait for connection
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
-    ESP_LOGI(TAG, "Connected to WiFi");
+    ESP_LOGI(TAG, "Connected to WiFi (NVS)");
 }
 
 /// @brief Prints the IP information of the specified network interface.
@@ -121,6 +219,8 @@ static void mqtt_publish_gpio_event(uint32_t gpio_num) {
     ESP_LOGI(TAG, "Published: %s", msg);
 }
 
+/// @brief GPIO task that monitors GPIO events.
+/// @param arg Pointer to task arguments (not used).
 static void gpio_task(void *arg) {
     uint32_t io_num;
     for (;;) {
@@ -134,7 +234,7 @@ static void gpio_task(void *arg) {
 /// It configures the client with a broker URI, username, and password, then creates and starts the client instance.
 /// @param  none.
 /// @return void
-static void mqtt_app_start(void) {
+void mqtt_app_start(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
             .address.uri = "mqtt://10.0.0.2:1883",
@@ -148,39 +248,6 @@ static void mqtt_app_start(void) {
     
     esp_mqtt_client_start(mqtt_client);
 }
-/* 
-/// @brief Starts the pin monitoring task.
-/// @param None
-/// @returns None   
-static void start_pin_monitor(void) {
-    // Initialize GPIO pins and set up ISR
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_ANYEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << GPIO_INPUT_PIN),
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&io_conf);
-
-    // Create a queue to handle GPIO events
-    gpio_event_queue = xQueueCreate(10, sizeof(uint32_t));
-
-    // Install ISR service
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-    
-    // Add ISR handler for GPIO input pin
-    //gpio_isr_handler_add(GPIO_INPUT_PIN, [](void* arg) {        
-    //    uint32_t io_num = (uint32_t)arg;
-    //    xQueueSendFromISR(gpio_event_queue, &io_num, NULL);
-    //}, (void*)GPIO_INPUT_PIN);
-    static void IRAM_ATTR gpio_isr_handler(void* arg) {
-    uint32_t io_num = (uint32_t)arg;
-    xQueueSendFromISR(gpio_event_queue, &io_num, NULL);
-}
-// Register the ISR
-gpio_isr_handler_add(GPIO_INPUT_PIN, gpio_isr_handler, (void*)GPIO_INPUT_PIN);
-}
- */
 
 /// @brief 
 /// The app_main function serves as the entry point for an ESP32 application, 
@@ -196,33 +263,35 @@ int app_main(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    wifi_init_sta();  // Waits until connected
+    // Check for Wi-Fi credentials in NVS
+    char ssid[32] = {0}, pass[64] = {0};
+    esp_err_t cred_err = ESP_OK;
+    nvs_handle_t nvs;
+    cred_err = nvs_open("wifi_store", NVS_READONLY, &nvs);
+    if (cred_err == ESP_OK) {
+        size_t ssid_len = sizeof(ssid);
+        size_t pass_len = sizeof(pass);
+        cred_err = nvs_get_str(nvs, "ssid", ssid, &ssid_len);
+        if (cred_err == ESP_OK) {
+            cred_err = nvs_get_str(nvs, "pass", pass, &pass_len);
+        }
+        nvs_close(nvs);
+    }
+
+    if (cred_err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi credentials not found in NVS, starting provisioning...");
+        ESP_ERROR_CHECK(wifi_provisioning_init());
+        ESP_ERROR_CHECK(wifi_provisioning_start());
+        // After provisioning, credentials will be saved and device will restart or reconnect
+        return 0;
+    } else {
+        ESP_LOGI(TAG, "Wi-Fi credentials found in NVS, starting normal Wi-Fi...");
+        wifi_init_sta_ext();  // Use credentials from NVS
+    }
+
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     print_ip_info(netif);
     
-    debounce_init();
-
-    gpio_event_queue = xQueueCreate(10, sizeof(uint32_t));
-    xTaskCreate(gpio_task, "gpio_task", 2048, NULL, 10, NULL);
-
-    debounce_config_t pin4_cfg = {
-    .pin = GPIO_NUM_4,
-    .intr_type = GPIO_INTR_POSEDGE,
-    .pull_up = true,
-    .debounce_time_us = 50000,
-    .mqtt_topic = "/pinMonitor/gpio4"
-    };
-    debounce_register_pin(&pin4_cfg);
-
-    debounce_config_t pin5_cfg = {
-        .pin = GPIO_NUM_5,
-        .intr_type = GPIO_INTR_NEGEDGE,
-        .pull_up = true,
-        .debounce_time_us = 75000,
-        .mqtt_topic = "/pinMonitor/gpio5"
-    };
-    debounce_register_pin(&pin5_cfg);
-
     mqtt_app_start(); // Now safe to start MQTT
 
     ESP_LOGI(TAG, "PinMonitor started");
