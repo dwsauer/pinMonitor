@@ -1,57 +1,131 @@
 #include <string.h>
 #include "wifi_provisioning.h"
 #include "web_server.h"
+
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_check.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
 #define MAX_RETRY 5
+#define NVS_NS_WIFI "wifi_store"
+#define NVS_KEY_SSID "ssid"
+#define NVS_KEY_PASS "pass"
+
 static const char *TAG = "wifi_prov";
 static int retry_count = 0;
+static bool s_wifi_started = false;
 
-static esp_err_t load_credentials(char *ssid, char *pass) {
+/* -------------------------------------------------------------------------- */
+/*                              NVS Credential IO                             */
+/* -------------------------------------------------------------------------- */
+static void save_credentials_nvs(const char *ssid, const char *pass)
+{
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open("wifi_store", NVS_READONLY, &nvs);
+    if (nvs_open(NVS_NS_WIFI, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed");
+        return;
+    }
+
+    if (nvs_set_str(nvs, NVS_KEY_SSID, ssid) != ESP_OK ||
+        nvs_set_str(nvs, NVS_KEY_PASS, pass) != ESP_OK ||
+        nvs_commit(nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save credentials");
+    }
+
+    nvs_close(nvs);
+}
+
+
+static esp_err_t load_credentials_nvs(char *ssid, size_t ssid_len,
+                                      char *pass, size_t pass_len)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NS_WIFI, NVS_READONLY, &nvs);
     if (err != ESP_OK) return err;
 
-    size_t ssid_len = 32, pass_len = 64;
-    err = nvs_get_str(nvs, "ssid", ssid, &ssid_len);
-    if (err == ESP_OK) err = nvs_get_str(nvs, "pass", pass, &pass_len);
+    err = nvs_get_str(nvs, NVS_KEY_SSID, ssid, &ssid_len);
+    if (err == ESP_OK) {
+        err = nvs_get_str(nvs, NVS_KEY_PASS, pass, &pass_len);
+    }
 
     nvs_close(nvs);
     return err;
 }
 
-static esp_err_t save_credentials(const char *ssid, const char *pass) {
-    nvs_handle_t nvs;
-    ESP_ERROR_CHECK(nvs_open("wifi_store", NVS_READWRITE, &nvs));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, "ssid", ssid));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, "pass", pass));
-    ESP_ERROR_CHECK(nvs_commit(nvs));
-    nvs_close(nvs);
-    return ESP_OK;
-}
-
-esp_err_t wifi_provisioning_init(void) {
+/* -------------------------------------------------------------------------- */
+/*                             WiFi Provisioning                              */
+/* -------------------------------------------------------------------------- */
+esp_err_t wifi_provisioning_init(void)
+{
+    // Fail-fast: system cannot continue without NVS, netif, event loop
     ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_wifi_init(&(wifi_init_config_t)WIFI_INIT_CONFIG_DEFAULT()));
+
     return ESP_OK;
 }
 
-esp_err_t wifi_provisioning_start(void) {
+static esp_err_t stop_softap_if_running(void)
+{
+    wifi_mode_t mode;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) return err;
+
+    if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) {
+        ESP_RETURN_ON_ERROR(esp_wifi_stop(), TAG, "Failed to stop SoftAP");
+        s_wifi_started = false;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t start_softap_provisioning(void)
+{
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = "ESP32_Setup",
+            .ssid_len = strlen("ESP32_Setup"),
+            .channel = 1,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "Failed to set AP mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg), TAG, "Failed to set AP config");
+
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start WiFi");
+        s_wifi_started = true;
+    }
+
+    web_server_start(save_credentials_nvs);
+    return ESP_OK;
+}
+
+esp_err_t wifi_provisioning_start(void)
+{
     char ssid[32] = {0}, pass[64] = {0};
-    if (load_credentials(ssid, pass) == ESP_OK) {
+    esp_err_t err = load_credentials_nvs(ssid, sizeof(ssid), pass, sizeof(pass));
+
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "Loaded SSID: %s", ssid);
-        wifi_config_t wifi_config = {};
-        strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-        strncpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
 
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-        ESP_ERROR_CHECK(esp_wifi_start());
-        ESP_ERROR_CHECK(esp_wifi_connect());
+        wifi_config_t wifi_cfg = {};
+        strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid));
+        strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password));
 
-        // Retry logic
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Failed to set STA mode");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), TAG, "Failed to set STA config");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Failed to start WiFi");
+        s_wifi_started = true;
+
+        ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "Failed to connect");
+
+        // Retry loop
+        retry_count = 0;
         while (retry_count < MAX_RETRY) {
             vTaskDelay(pdMS_TO_TICKS(2000));
             wifi_ap_record_t ap_info;
@@ -65,26 +139,19 @@ esp_err_t wifi_provisioning_start(void) {
         ESP_LOGW(TAG, "Failed to connect. Entering provisioning mode...");
     }
 
-    // Fallback to SoftAP + Web Server
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "ESP32_Setup",
-            .ssid_len = strlen("ESP32_Setup"),
-            .channel = 1,
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        }
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    web_server_start(save_credentials);  // Callback to save creds
+    // Fallback to SoftAP provisioning
+    ESP_RETURN_ON_ERROR(start_softap_provisioning(), TAG, "SoftAP provisioning failed");
     return ESP_OK;
 }
 
-esp_err_t wifi_provisioning_stop(void) {
+esp_err_t wifi_provisioning_stop(void)
+{
     web_server_stop();
-    esp_wifi_stop();
+    ESP_RETURN_ON_ERROR(stop_softap_if_running(), TAG, "Failed to stop SoftAP");
+
+    if (s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_stop(), TAG, "Failed to stop WiFi");
+        s_wifi_started = false;
+    }
     return ESP_OK;
 }
