@@ -28,6 +28,7 @@ static void html_escape(char *dst, size_t dst_sz, const char *src)
 /* Serve provisioning page with scanned SSIDs */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    ESP_LOGI(TAG, "Heap before scan: %u", esp_get_free_heap_size());
     // Do a blocking scan
     wifi_scan_config_t scan_cfg = {
         .ssid = 0,
@@ -39,9 +40,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     uint16_t ap_count = 0;
     esp_wifi_scan_get_ap_num(&ap_count);
+    ESP_LOGI(TAG, "Scan found %u APs", ap_count);
+
+    if (ap_count == 0) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_sendstr(req, "<html><body><h3>No Wi-Fi networks found. Please try again.</h3></body></html>");
+        return ESP_OK;
+    }
 
     wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
     if (!ap_records) {
+        ESP_LOGE(TAG, "Heap after scan: %u", esp_get_free_heap_size());
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
         return ESP_FAIL;
     }
@@ -76,6 +85,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     httpd_resp_sendstr_chunk(req, NULL); // end of chunked response
     free(ap_records);
+    ESP_LOGI(TAG, "Heap after response: %u", esp_get_free_heap_size());
     return ESP_OK;
 }
 
@@ -88,8 +98,10 @@ static esp_err_t submit_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    ESP_LOGI(TAG, "Heap before POST alloc: %u", esp_get_free_heap_size());
     char *buf = calloc(1, total_len + 1);
     if (!buf) {
+        ESP_LOGE(TAG, "Heap after POST alloc fail: %u", esp_get_free_heap_size());
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
         return ESP_ERR_NO_MEM;
     }
@@ -128,7 +140,8 @@ static esp_err_t submit_post_handler(httpd_req_t *req)
     for (char *p = ssid; *p; ++p) if (*p == '+') *p = ' ';
     for (char *p = pass; *p; ++p) if (*p == '+') *p = ' ';
 
-    ESP_LOGI(TAG, "Parsed SSID=\"%s\" PASS=\"%s\"", ssid, pass);
+    ESP_LOGI(TAG, "User selected SSID: '%s'", ssid);
+    ESP_LOGI(TAG, "User entered password: '%s'", pass);
 
     if (s_save_fn && ssid[0]) {
         s_save_fn(ssid, pass);
@@ -138,6 +151,7 @@ static esp_err_t submit_post_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, "<html><body><h3>Credentials saved. ESP32 will reconnect.</h3></body></html>");
 
     free(buf);
+    ESP_LOGI(TAG, "Heap after POST response: %u", esp_get_free_heap_size());
     return ESP_OK;
 }
 

@@ -16,5 +16,6 @@
     "--query-driver=C:\\Users\\david\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
     "--compile-commands-dir=c:\\Users\\david\\Projects\\pinMonitor\\build"
   ],
-  "idf.flashType": "JTAG"
+  "idf.flashType": "JTAG",
+  "github.copilot.chat.agent.thinkingTool": true
 }

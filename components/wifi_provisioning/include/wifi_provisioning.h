@@ -6,6 +6,7 @@
 extern "C" {
 #endif
 
+#define ERASE_WIFI_CREDENTIALS_AT_STARTUP
 esp_err_t wifi_provisioning_init(void);
 esp_err_t wifi_provisioning_start(void);
 esp_err_t wifi_provisioning_stop(void);
