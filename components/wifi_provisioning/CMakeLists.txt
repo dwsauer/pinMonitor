@@ -1,14 +1,13 @@
 idf_component_register(
-    SRCS 
-        "src/web_server.c" 
+    SRCS
         "src/wifi_provisioning.c"
-    INCLUDE_DIRS 
-        "."
+        "src/web_server.c"
+    INCLUDE_DIRS
         "include"
-    REQUIRES 
-        nvs_flash 
-        esp_wifi 
-        esp_event 
-        esp_http_server 
-        esp_common
+    REQUIRES
+        app_shared
+        esp_wifi
+        esp_event
+        esp_http_server
+        nvs_flash
 )

@@ -1,0 +1,19 @@
+flowchart TD
+    A[Power On / Reset] --> B[Bootloader]
+    B --> C[app_main()]
+    C --> D[nvs_flash_init, esp_netif_init, esp_event_loop_create_default]
+    D --> E{Wi-Fi credentials in NVS?}
+    E -- ERASE_WIFI_CREDENTIALS_AT_STARTUP defined --> F[Erase credentials in NVS]
+    F --> G[Start Wi-Fi Provisioning]
+    E -- No --> G
+    E -- Yes --> H[Start normal Wi-Fi (STA)]
+    H --> I[Connect to Wi-Fi]
+    I --> J[Start MQTT client]
+    G --> K[Set AP+STA mode]
+    K --> L[Start SoftAP (ESP32_Setup)]
+    L --> M[Start Web Server]
+    M --> N[User connects to AP, browses to 192.168.4.1]
+    N --> O[User selects SSID, enters password]
+    O --> P[Save credentials to NVS]
+    P --> Q[Restart or reconnect]
+    Q --> D
