@@ -1,256 +1,292 @@
+// File: main/main.c
 /**
- * @file main.c
- * @brief PinMonitor application for ESP32 with Wi-Fi and MQTT integration.
+ * @file    main.c
+ * @brief   PinMonitor app: Wi-Fi + MQTT + debounced GPIO event publishing.
  *
- * This application monitors GPIO pins with debounce logic and publishes pin events to an MQTT broker.
- * It initializes Wi-Fi in station mode, connects to a specified network, and starts an MQTT client.
- * GPIO pins are configured with interrupt and debounce handling, and their state changes are sent as MQTT messages.
+ * @details
+ * Startup flow:
+ *  1) Initialize NVS, netif, and event loop (once).
+ *  2) If Wi-Fi credentials exist in NVS (namespace @c wifi_store, keys @c ssid, @c password),
+ *     connect in STA mode; otherwise start provisioning (SoftAP web UI).
+ *  3) Start the MQTT client.
+ *  4) Create @c gpio_event_queue, start a task to publish events, and register debounced GPIOs.
  *
- * Features:
- * - Wi-Fi initialization and connection management.
- * - MQTT client setup and event publishing.
- * - GPIO pin monitoring with configurable debounce logic.
- * - Task-based event handling using FreeRTOS.
+ * Debounce:
+ *  - The @c debounce component rearms a one-shot timer from the ISR on every GPIO edge.
+ *  - When the timer expires, the pin is sampled in task context and an event is queued
+ *    **only** if the final stable level equals the configured @c report_level.
  *
- * Modules Used:
- * - ESP-IDF Wi-Fi, MQTT, GPIO, FreeRTOS, and timer APIs.
- * - Custom debounce and Wi-Fi manager modules.
+ * MQTT:
+ *  - This app publishes simple messages for demonstration. You can switch to JSON payloads
+ *    or richer schemas easily in @ref gpio_task.
  *
- * Configuration:
- * - Wi-Fi SSID and password are stored in NVS.
- * - MQTT broker URI, username, and password are hardcoded (demo).
- * - GPIO pins and debounce parameters are configurable.
- *
- * Usage:
- * - Deploy on ESP32 hardware.
- * - Ensure network and MQTT broker availability.
- * - Monitor MQTT topic for pin events.
- *
- * @author David Sauer
- * @date 8/18/2025
+ * Safety notes:
+ *  - Avoid duplicating @c esp_netif_init() / @c esp_event_loop_create_default() (do them once).
+ *  - Create @c gpio_event_queue before registering pins to avoid a race if an ISR fires early.
+ *  - Do not include private headers from components (e.g., @c private/debounce_internal.h).
  */
+// File: main/main.c (includes)
+#include <stdio.h>                     // snprintf
+#include <string.h>                    // strncpy
 
-// Git test 8/18/2025 1620
-
-#include <stdio.h>
-#include <string.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "driver/gpio.h"
-#include "esp_log.h"
-#include "mqtt_client.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
-#include "esp_wifi.h"
-#include "esp_timer.h"
+#include "freertos/task.h"             // xTaskCreate
+#include "freertos/queue.h"            // xQueueCreate, xQueueReceive
+#include "freertos/event_groups.h"     // EventGroupHandle_t, xEventGroupSetBits
 
-#include "debounce.h"
-#include "wifi_manager.h"
-#include "wifi_provisioning.h"
-#include "app_shared.h"
+#include "esp_log.h"                   // ESP_LOG*
+#include "esp_err.h"                   // ESP_ERROR_CHECK, esp_err_t
+#include "nvs_flash.h"                 // nvs_flash_init
+#include "nvs.h"                       // nvs_open/get_str/close   <-- add this
 
-static EventGroupHandle_t wifi_event_group;
+#include "esp_event.h"                 // esp_event_loop_create_default, handlers
+#include "esp_netif.h"                 // esp_netif_*, IPSTR
+#include "esp_wifi.h"                  // Wi-Fi APIs
+#include "mqtt_client.h"               // MQTT client APIs
+
+#include "debounce.h"                  // debouncer API (also pulls in driver/gpio.h)
+#include "wifi_provisioning.h"         // provisioning init/start
+#include "app_shared.h"                // gpio_event_t, extern queue
+
+
+/* ===== Globals (single definitions here; use extern elsewhere) ===== */
 static const char *TAG = "PinMonitor";
-
-// ==== GLOBALS (single definitions; extern in main_priv.h) ====
 QueueHandle_t gpio_event_queue = NULL;
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
-void mqtt_app_start(void);
-static void pin_monitor_init(void);
+/* ===== Forward declarations ===== */
 static void gpio_task(void *arg);
+static void pin_monitor_init(void);
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
+static void wifi_init_sta_ext(void);
+static void print_ip_info(esp_netif_t *netif);
+static void mqtt_app_start(void);
 
+/* ===== Wi-Fi sync bits ===== */
+static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
-#define ESP_INTR_FLAG_DEFAULT 0
 
-// ---- GPIO event handling task (publishes MQTT from main context) ----
+/* -------------------------------------------------------------------------- */
+/*                         GPIO event -> MQTT task                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @brief Task that consumes @c gpio_event_queue and publishes via MQTT.
+ *
+ * @note For production, prefer JSON payloads and QoS that matches your reliability needs.
+ */
 static void gpio_task(void *arg)
 {
     gpio_event_t evt;
-    for (;;)
-    {
-        if (xQueueReceive(gpio_event_queue, &evt, portMAX_DELAY))
-        {
+    for (;;) {
+        if (xQueueReceive(gpio_event_queue, &evt, portMAX_DELAY) == pdTRUE) {
+            // Example payload (plain text). Swap to JSON if desired.
             char msg[64];
-            snprintf(msg, sizeof(msg),
-                     "GPIO %d is now %s",
-                     evt.pin, evt.level ? "HIGH" : "LOW");
+            snprintf(msg, sizeof(msg), "GPIO %d is now %s",
+                     (int)evt.pin, evt.level ? "HIGH" : "LOW");
 
+            const char *topic = evt.topic ? evt.topic : "/pinMonitor/event";
             if (mqtt_client) {
-                esp_mqtt_client_publish(mqtt_client, evt.topic ? evt.topic : "/pinMonitor/event",
-                                        msg, 0, 1, 0);
+                esp_mqtt_client_publish(mqtt_client, topic, msg, 0, 1, 0);
             }
-            ESP_LOGI(TAG, "Published: %s", msg);
+            ESP_LOGI(TAG, "Published: %s  %s", topic, msg);
         }
     }
 }
 
-// ---- Debounce + queue setup (GPIO handling happens in main) ----
+/* -------------------------------------------------------------------------- */
+/*                         Debounce + queue setup                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @brief Create the event queue, start the publisher task, and register debounced GPIOs.
+ *
+ * @note Prefer @c GPIO_INTR_ANYEDGE + set @c report_level to the final level that should
+ *       emit an event. This ensures the opposite transition retriggers the debounce window.
+ */
 static void pin_monitor_init(void)
 {
-    debounce_init();
+    ESP_ERROR_CHECK(debounce_init());
 
-    // Queue holds gpio_event_t sent by debounce.c timer callback
-    gpio_event_queue = xQueueCreate(10, sizeof(gpio_event_t));
+    // Ensure the queue exists before any interrupts can fire
+    if (!gpio_event_queue) {
+        gpio_event_queue = xQueueCreate(10, sizeof(gpio_event_t));
+    }
+
+    // Start the dispatcher task
     xTaskCreate(gpio_task, "gpio_task", 4096, NULL, 10, NULL);
 
-    debounce_config_t pin4_cfg = {
-        .pin = GPIO_NUM_4,
-        .intr_type = GPIO_INTR_POSEDGE,
-        .pull_up = true,
-        .debounce_time_us = 50000,
-        .mqtt_topic = "/pinMonitor/gpio4"
-    };
-    debounce_register_pin(&pin4_cfg);
+    // --- Example GPIO registrations ---
+    // NOTE: If your debounce_config_t lacks .pull_down or .report_level (older version),
+    //       remove those fields or update the header first.
 
-    debounce_config_t pin5_cfg = {
-        .pin = GPIO_NUM_5,
-        .intr_type = GPIO_INTR_NEGEDGE,
+    debounce_config_t pin4 = {
+        .pin = GPIO_NUM_4,
+        .intr_type = GPIO_INTR_ANYEDGE,   // prefer ANYEDGE
         .pull_up = true,
-        .debounce_time_us = 75000,
-        .mqtt_topic = "/pinMonitor/gpio5"
+        .pull_down = false,
+        .debounce_time_us = 50 * 1000,
+        .report_level = DEBOUNCE_REPORT_HIGH, // emit only when stable HIGH
+        .mqtt_topic = "/pinMonitor/gpio4",
     };
-    debounce_register_pin(&pin5_cfg);
+    ESP_ERROR_CHECK(debounce_register_pin(&pin4));
+
+    debounce_config_t pin5 = {
+        .pin = GPIO_NUM_5,
+        .intr_type = GPIO_INTR_ANYEDGE,
+        .pull_up = true,
+        .pull_down = false,
+        .debounce_time_us = 75 * 1000,
+        .report_level = DEBOUNCE_REPORT_LOW,  // emit only when stable LOW
+        .mqtt_topic = "/pinMonitor/gpio5",
+    };
+    ESP_ERROR_CHECK(debounce_register_pin(&pin5));
 }
 
-// ---- Basic Wi-Fi station init using creds from NVS "wifi_store" ----
+/* -------------------------------------------------------------------------- */
+/*                               Wi-Fi helpers                                */
+/* -------------------------------------------------------------------------- */
+
+/** @brief Basic Wi-Fi event handler: connect/reconnect & set connected bit. */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-    {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         esp_wifi_connect();
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-void wifi_init_sta_ext(void)
+/**
+ * @brief Initialize Wi-Fi station using credentials from NVS.
+ *
+ * @details
+ * Expects NVS namespace "wifi_store" with keys "ssid" and "password".
+ * Assumes @c esp_netif_init and @c esp_event_loop_create_default were already called.
+ */
+static void wifi_init_sta_ext(void)
 {
     wifi_event_group = xEventGroupCreate();
 
-    esp_netif_init();
-    esp_event_loop_create_default();
+    // These are already done once in app_main():
+    // esp_netif_init();
+    // esp_event_loop_create_default();
+
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
     // Read SSID and password from NVS
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("wifi_store", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Error opening NVS handle: %s", esp_err_to_name(err));
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("wifi_store", NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open (wifi_store) failed: %s", esp_err_to_name(err));
         return;
     }
 
     char ssid[32] = {0};
     char password[64] = {0};
-    size_t ssid_len = sizeof(ssid);
-    size_t password_len = sizeof(password);
+    size_t ssid_len = sizeof(ssid), pass_len = sizeof(password);
 
-    err = nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len);
-    if (err != ESP_OK)
-    {
+    err = nvs_get_str(nvs, "ssid", ssid, &ssid_len);
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "SSID not found in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs_handle);
+        nvs_close(nvs);
         return;
     }
-
-    // Unified on "password" key
-    err = nvs_get_str(nvs_handle, "password", password, &password_len);
-    if (err != ESP_OK)
-    {
+    err = nvs_get_str(nvs, "password", password, &pass_len);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "Password not found in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs_handle);
         return;
     }
 
-    nvs_close(nvs_handle);
+    wifi_config_t wifi_cfg = {0};
+    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid));
+    strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password));
 
-    wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    err = esp_wifi_start();
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to start WiFi: %s", esp_err_to_name(err));
-        return;
+    // Wait until connected
+    (void)xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+    ESP_LOGI(TAG, "Connected to Wi-Fi (NVS)");
+}
+
+/** @brief Log assigned IP information for a netif. */
+static void print_ip_info(esp_netif_t *netif)
+{
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(netif, &ip) == ESP_OK) {
+        ESP_LOGI("NETIF", "IP Address: " IPSTR, IP2STR(&ip.ip));
+        ESP_LOGI("NETIF", "Gateway:   " IPSTR, IP2STR(&ip.gw));
+        ESP_LOGI("NETIF", "Netmask:   " IPSTR, IP2STR(&ip.netmask));
     }
-
-    // Wait for connection
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
-    ESP_LOGI(TAG, "Connected to WiFi (NVS)");
 }
 
-void print_ip_info(esp_netif_t *netif)
-{
-    esp_netif_ip_info_t ip_info;
-    esp_netif_get_ip_info(netif, &ip_info);
+/* -------------------------------------------------------------------------- */
+/*                               MQTT startup                                 */
+/* -------------------------------------------------------------------------- */
 
-    ESP_LOGI("NETIF", "IP Address: " IPSTR, IP2STR(&ip_info.ip));
-    ESP_LOGI("NETIF", "Gateway:   " IPSTR, IP2STR(&ip_info.gw));
-    ESP_LOGI("NETIF", "Netmask:   " IPSTR, IP2STR(&ip_info.netmask));
-}
+/**
+ * @brief Start the MQTT client.
+ *
+ * @note Consider reading URI/credentials from NVS (namespace "mqtt_store") instead
+ *       of hardcoding secrets if the repo is public.
+ */
 
-// ---- MQTT setup ----
-void mqtt_app_start(void)
+/* static void mqtt_app_start(void)
 {
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker = {
-            .address.uri = "mqtt://10.0.0.2:1883",
-        },
-        .credentials = {
-            .username = "david1952",
-            .authentication.password = "M9JP0Hz2iHaDbSX9CHn5",
-        }
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = "mqtt://10.0.0.2:1883",
+        .credentials.username = "david1952",
+        .credentials.authentication.password = "M9JP0Hz2iHaDbSX9CHn5",
     };
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_start(mqtt_client);
+    mqtt_client = esp_mqtt_client_init(&cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
+}*/
+static void mqtt_app_start(void)
+{
+    // Read MQTT creds from NVS (written by provisioning page)
+    char uri[128]={0}, user[64]={0}, pass[64]={0};
+    size_t ulen=sizeof(uri), nlen=sizeof(user), plen=sizeof(pass);
+    nvs_handle_t h;
+    if (nvs_open("mqtt_store", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_str(h, "uri",  uri,  &ulen);
+        nvs_get_str(h, "user", user, &nlen);
+        nvs_get_str(h, "pass", pass, &plen);
+        nvs_close(h);
+    }
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = uri[0] ? uri : "mqtt://10.0.0.2:1883",
+        .credentials.username = user[0] ? user : NULL,
+        .credentials.authentication.password = pass[0] ? pass : NULL,
+    };
+    mqtt_client = esp_mqtt_client_init(&cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
 }
+/* -------------------------------------------------------------------------- */
+/*                                 app_main                                   */
+/* -------------------------------------------------------------------------- */
 
-// ---- Entry point ----
+/**
+ * @brief Program entry: init, Wi-Fi/MQTT, and start pin monitoring.
+ */
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Robust Wi-Fi credential check (unified keys)
-    char ssid[32] = {0}, pass[64] = {0};
-    bool creds_valid = false;
-    nvs_handle_t nvs;
-    esp_err_t nvs_err = nvs_open("wifi_store", NVS_READONLY, &nvs);
-    if (nvs_err == ESP_OK)
-    {
-        size_t ssid_len = sizeof(ssid);
-        size_t pass_len = sizeof(pass);
-        esp_err_t ssid_err = nvs_get_str(nvs, "ssid", ssid, &ssid_len);
-        // Use "password" key (matches wifi_init_sta_ext)
-        esp_err_t pass_err = nvs_get_str(nvs, "password", pass, &pass_len);
-        nvs_close(nvs);
-        if (ssid_err == ESP_OK && pass_err == ESP_OK && ssid[0] != '\0')
-        {
-            creds_valid = true;
-        }
-    }
-
-#ifdef ERASE_WIFI_CREDENTIALS_AT_STARTUP
+#if CONFIG_PINMON_ERASE_WIFI_ON_BOOT
     ESP_LOGW(TAG, "Wi-Fi credentials forced erase, starting provisioning...");
     ESP_ERROR_CHECK(wifi_provisioning_init());
     ESP_ERROR_CHECK(wifi_provisioning_start());
@@ -258,26 +294,36 @@ void app_main(void)
     return;
 #endif
 
-    if (!creds_valid)
+    // Check Wi-Fi creds before normal flow
+    bool creds_valid = false;
     {
-        ESP_LOGW(TAG, "Wi-Fi credentials not found or invalid in NVS, starting provisioning...");
+        nvs_handle_t nvs;
+        if (nvs_open("wifi_store", NVS_READONLY, &nvs) == ESP_OK) {
+            char ssid[32] = {0}, pass[64] = {0};
+            size_t ssid_len = sizeof(ssid), pass_len = sizeof(pass);
+            esp_err_t e1 = nvs_get_str(nvs, "ssid", ssid, &ssid_len);
+            esp_err_t e2 = nvs_get_str(nvs, "password", pass, &pass_len);
+            nvs_close(nvs);
+            creds_valid = (e1 == ESP_OK && e2 == ESP_OK && ssid[0] != '\0');
+        }
+    }
+
+    if (!creds_valid) {
+        ESP_LOGW(TAG, "Wi-Fi credentials missing; starting provisioning...");
         ESP_ERROR_CHECK(wifi_provisioning_init());
         ESP_ERROR_CHECK(wifi_provisioning_start());
-        ESP_LOGI(TAG, "Skipping normal Wi-Fi and MQTT since credentials are missing or invalid.");
+        ESP_LOGI(TAG, "Provisioning active; skipping STA/MQTT/monitor.");
         return;
     }
-    else
-    {
-        ESP_LOGI(TAG, "Wi-Fi credentials found in NVS, starting normal Wi-Fi...");
-        wifi_init_sta_ext(); // Use credentials from NVS
-        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (netif) {
-            print_ip_info(netif);
-        } else {
-            ESP_LOGW(TAG, "WIFI_STA_DEF netif not found");
-        }
-        mqtt_app_start(); // Now safe to start MQTT
-        pin_monitor_init(); // start debounce + queue + task
-        ESP_LOGI(TAG, "PinMonitor started");
+
+    // Normal STA + MQTT path
+    wifi_init_sta_ext();    
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        print_ip_info(netif);
     }
+    mqtt_app_start();
+    pin_monitor_init();
+
+    ESP_LOGI(TAG, "PinMonitor started");
 }

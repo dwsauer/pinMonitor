@@ -1,207 +1,324 @@
+// File: components/wifi_provisioning/src/web_server.c
+/**
+ * @file   web_server.c
+ * @brief  Tiny provisioning web server for pinMonitor (Wi-Fi + MQTT).
+ *
+ * @details
+ *  - GET "/" renders a form:
+ *      * Shows scanned SSIDs (dropdown)
+ *      * Accepts Wi-Fi password
+ *      * Accepts MQTT URI / username / password
+ *  - POST "/submit" saves:
+ *      * Wi-Fi → NVS "wifi_store": keys "ssid", "password"
+ *      * MQTT → NVS "mqtt_store": keys "uri", "user", "pass"
+ *    then reboots the device.
+ *
+ * Implementation notes
+ *  - Uses blocking Wi-Fi scan inside the GET handler (simple + fine for provisioning).
+ *  - Avoids large format buffers for `<option>` rows by streaming HTML in small chunks,
+ *    eliminating -Wformat-truncation warnings/errors.
+ *  - POST body parser handles application/x-www-form-urlencoded, including '+' and %xx decoding.
+ *  - Does NOT log secrets (Wi-Fi/MQTT passwords).
+ */
+
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+
 #include "esp_log.h"
+#include "esp_err.h"
+#include "esp_system.h"         // esp_restart
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "web_server.h"
 
 static const char *TAG = "web_server";
 
+/* Server handle for lifecycle management */
 static httpd_handle_t s_server = NULL;
-static void (*s_save_fn)(const char *, const char *) = NULL;
 
-/* Small HTML escape (only quotes & < > for now) */
-static void html_escape(char *dst, size_t dst_sz, const char *src)
-{
+/* ============================================================
+ *                      Small helper utilities
+ * ============================================================*/
+
+/* Decode one hex digit to nibble; returns -1 on invalid char */
+static int hex2nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+/**
+ * @brief URL-decode an x-www-form-urlencoded string in place.
+ *        Converts '+' to space and %xx hex escapes.
+ */
+static void url_decode_inplace(char *s) {
+    char *w = s;
+    for (; *s; ++s) {
+        if (*s == '+') { *w++ = ' '; }
+        else if (*s == '%' && s[1] && s[2]) {
+            int hi = hex2nibble(s[1]), lo = hex2nibble(s[2]);
+            if (hi >= 0 && lo >= 0) { *w++ = (char)((hi<<4) | lo); s += 2; }
+        } else { *w++ = *s; }
+    }
+    *w = '\0';
+}
+
+/**
+ * @brief Extract key=value from an x-www-form-urlencoded buffer.
+ *        Writes a NUL-terminated decoded value to @p out (may be empty string).
+ * @return true if key found, false otherwise.
+ */
+static bool form_get(const char *body, const char *key, char *out, size_t out_len) {
+    if (!body || !key || !out || out_len == 0) return false;
+    out[0] = '\0';
+    const size_t klen = strlen(key);
+    const char *p = body;
+    while ((p = strstr(p, key))) {
+        const bool at_field_start = (p == body) || (p[-1] == '&');
+        if (at_field_start && p[klen] == '=') {
+            p += klen + 1;
+            size_t i = 0;
+            while (p[i] && p[i] != '&' && i + 1 < out_len) { out[i] = p[i]; i++; }
+            out[i] = '\0';
+            url_decode_inplace(out);
+            return true;
+        }
+        p += klen;
+    }
+    return false;
+}
+
+/**
+ * @brief Minimal HTML escaper for SSID display/values.
+ *        Escapes &, <, >, " to entities. Safe for attribute and text contexts.
+ *
+ * @param dst    Destination buffer (NUL-terminated on return)
+ * @param dst_sz Size of destination buffer
+ * @param src    Input string (may be non-terminated 802.11 SSID bytes in practice;
+ *               IDF exposes them as a C string so this is fine)
+ */
+static void html_escape(char *dst, size_t dst_sz, const char *src) {
     size_t j = 0;
     for (size_t i = 0; src[i] && j + 6 < dst_sz; i++) {
         char c = src[i];
-        if (c == '<') { j += snprintf(dst + j, dst_sz - j, "&lt;"); }
+        if (c == '&') { j += snprintf(dst + j, dst_sz - j, "&amp;"); }
+        else if (c == '<') { j += snprintf(dst + j, dst_sz - j, "&lt;"); }
         else if (c == '>') { j += snprintf(dst + j, dst_sz - j, "&gt;"); }
         else if (c == '"') { j += snprintf(dst + j, dst_sz - j, "&quot;"); }
-        else if (c == '&') { j += snprintf(dst + j, dst_sz - j, "&amp;"); }
         else { dst[j++] = c; }
     }
     dst[j] = '\0';
 }
 
-/* Serve provisioning page with scanned SSIDs */
+/* NVS set helper: store empty string if val is NULL/empty */
+static esp_err_t nvs_set_str_checked(nvs_handle_t h, const char *key, const char *val) {
+    return nvs_set_str(h, key, (val && val[0]) ? val : "");
+}
+
+/* ============================================================
+ *                          HTTP handlers
+ * ============================================================*/
+
+/**
+ * @brief GET "/" — Render provisioning form after a blocking Wi-Fi scan.
+ *
+ * Implementation detail to avoid -Wformat-truncation:
+ *   We **stream** `<option>` rows in small chunks instead of snprintf into a
+ *   large temporary buffer. This handles worst-case HTML expansion (each SSID
+ *   byte could become &amp; → 5 chars) without huge stack arrays or warnings.
+ */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "Heap before scan: %u", esp_get_free_heap_size());
-    // Do a blocking scan
-    wifi_scan_config_t scan_cfg = {
-        .ssid = 0,
-        .bssid = 0,
-        .channel = 0,
-        .show_hidden = false
-    };
-    esp_wifi_scan_start(&scan_cfg, true);
+    // 1) Scan synchronously (keeps code simple)
+    wifi_scan_config_t scan_cfg = { .ssid = 0, .bssid = 0, .channel = 0, .show_hidden = false };
+    (void)esp_wifi_scan_start(&scan_cfg, true);
 
     uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    ESP_LOGI(TAG, "Scan found %u APs", ap_count);
+    (void)esp_wifi_scan_get_ap_num(&ap_count);
 
-    if (ap_count == 0) {
-        httpd_resp_set_type(req, "text/html");
-        httpd_resp_sendstr(req, "<html><body><h3>No Wi-Fi networks found. Please try again.</h3></body></html>");
-        return ESP_OK;
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+
+    wifi_ap_record_t *ap_records = NULL;
+    if (ap_count) {
+        ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
+        if (ap_records) (void)esp_wifi_scan_get_ap_records(&ap_count, ap_records);
     }
 
-    wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
-    if (!ap_records) {
-        ESP_LOGE(TAG, "Heap after scan: %u", esp_get_free_heap_size());
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
-        return ESP_FAIL;
-    }
-
-    esp_wifi_scan_get_ap_records(&ap_count, ap_records);
-
-    // Build HTML
-    httpd_resp_set_type(req, "text/html");
+    // 2) Page header + form start
     httpd_resp_sendstr_chunk(req,
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
-        "<title>ESP32 Wi-Fi Setup</title></head><body>"
-        "<h2>Wi-Fi Provisioning</h2>"
-        "<form action=\"/submit\" method=\"post\">"
-        "SSID:<br><select name=\"ssid\">");
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>pinMonitor Setup</title>"
+        "<style>body{font-family:sans-serif;max-width:700px;margin:2rem auto;padding:0 1rem}"
+        "label{display:block;margin:.6rem 0 .25rem}input,select{width:100%;padding:.5rem}"
+        "button{margin-top:1rem;padding:.6rem 1rem}</style></head><body>"
+        "<h2>pinMonitor Setup</h2>"
+        "<form action='/submit' method='post'>"
 
-    for (int i = 0; i < ap_count; i++) {
-        char ssid_safe[64];
-        html_escape(ssid_safe, sizeof(ssid_safe), (char *)ap_records[i].ssid);
+        "<h3>Wi-Fi</h3>"
+        "<label>SSID</label><select name='ssid'>");
 
-        char option[128];
-        snprintf(option, sizeof(option),
-                 "<option value=\"%.32s\">%.32s (RSSI %d)</option>",
-                 ssid_safe, ssid_safe, ap_records[i].rssi);
-        httpd_resp_sendstr_chunk(req, option);
+    // 3) Options (streamed)
+    if (ap_records) {
+        for (int i = 0; i < ap_count; i++) {
+            // Worst-case escaped length for 32-byte SSID: 32 * 5 (+NUL) = 161 → use 192
+            char ssid_safe[192];
+            html_escape(ssid_safe, sizeof(ssid_safe), (const char *)ap_records[i].ssid);
+
+            httpd_resp_sendstr_chunk(req, "<option value=\"");
+            httpd_resp_sendstr_chunk(req, ssid_safe);
+            httpd_resp_sendstr_chunk(req, "\">");
+            httpd_resp_sendstr_chunk(req, ssid_safe);
+
+            char rssi_buf[24];
+            snprintf(rssi_buf, sizeof(rssi_buf), " (RSSI %d)</option>", ap_records[i].rssi);
+            httpd_resp_sendstr_chunk(req, rssi_buf);
+        }
+    } else {
+        httpd_resp_sendstr_chunk(req, "<option value=''>-- No networks found --</option>");
     }
 
+    // 4) Rest of form
     httpd_resp_sendstr_chunk(req,
-        "</select><br><br>"
-        "Password:<br><input type=\"password\" name=\"pass\"><br><br>"
-        "<input type=\"submit\" value=\"Save\">"
+        "</select>"
+        "<label>Password</label><input type='password' name='pass' maxlength='63'>"
+
+        "<h3>MQTT</h3>"
+        "<label>Broker URI (e.g., mqtt://10.0.0.2:1883)</label>"
+        "<input name='mqtt_uri' maxlength='127' placeholder='mqtt://host:1883' required>"
+        "<label>Username</label><input name='mqtt_user' maxlength='63' placeholder='(optional)'>"
+        "<label>Password</label><input type='password' name='mqtt_pass' maxlength='63' placeholder='(optional)'>"
+
+        "<button type='submit'>Save & Reboot</button>"
         "</form></body></html>");
 
-    httpd_resp_sendstr_chunk(req, NULL); // end of chunked response
+    // 5) Finish chunked response
+    httpd_resp_sendstr_chunk(req, NULL);
+
     free(ap_records);
-    ESP_LOGI(TAG, "Heap after response: %u", esp_get_free_heap_size());
     return ESP_OK;
 }
 
-/* Handle form submission (same as before) */
+/**
+ * @brief POST "/submit" — Parse form, save to NVS, and reboot.
+ *
+ * Security: does not log plaintext passwords.
+ */
 static esp_err_t submit_post_handler(httpd_req_t *req)
 {
-    int total_len = req->content_len;
-    if (total_len <= 0) {
+    const int to_read = req->content_len;
+    if (to_read <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Heap before POST alloc: %u", esp_get_free_heap_size());
-    char *buf = calloc(1, total_len + 1);
-    if (!buf) {
-        ESP_LOGE(TAG, "Heap after POST alloc fail: %u", esp_get_free_heap_size());
+    // Read the whole x-www-form-urlencoded body
+    char *body = calloc(1, to_read + 1);
+    if (!body) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
         return ESP_ERR_NO_MEM;
     }
 
-    int recv_len = httpd_req_recv(req, buf, total_len);
-    if (recv_len <= 0) {
-        free(buf);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv error");
-        return ESP_FAIL;
+    int total = 0;
+    while (total < to_read) {
+        int r = httpd_req_recv(req, body + total, to_read - total);
+        if (r <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv error"); return ESP_FAIL; }
+        total += r;
     }
-    buf[recv_len] = '\0';
+    body[total] = '\0';
 
-    ESP_LOGI(TAG, "Form body: %s", buf);
+    // Extract fields (URL-decodes into fixed buffers)
+    char ssid[32]={0}, pass[64]={0}, uri[128]={0}, user[64]={0}, mpass[64]={0};
+    (void)form_get(body, "ssid",      ssid, sizeof(ssid));
+    (void)form_get(body, "pass",      pass, sizeof(pass));
+    (void)form_get(body, "mqtt_uri",  uri,  sizeof(uri));
+    (void)form_get(body, "mqtt_user", user, sizeof(user));
+    (void)form_get(body, "mqtt_pass", mpass,sizeof(mpass));
 
-    char ssid[32] = {0}, pass[64] = {0};
-    char *ssid_ptr = strstr(buf, "ssid=");
-    char *pass_ptr = strstr(buf, "pass=");
+    // Log non-sensitive summary (do NOT log passwords)
+    ESP_LOGI(TAG, "Provision request: SSID='%s', MQTT URI='%s', MQTT user='%s'",
+             ssid, uri, user[0] ? user : "(none)");
 
-    if (ssid_ptr) {
-        ssid_ptr += 5;
-        char *end = strchr(ssid_ptr, '&');
-        size_t len = end ? (size_t)(end - ssid_ptr) : strlen(ssid_ptr);
-        if (len >= sizeof(ssid)) len = sizeof(ssid) - 1;
-        strncpy(ssid, ssid_ptr, len);
-        ssid[len] = '\0';
-    }
-    if (pass_ptr) {
-        pass_ptr += 5;
-        size_t len = strlen(pass_ptr);
-        if (len >= sizeof(pass)) len = sizeof(pass) - 1;
-        strncpy(pass, pass_ptr, len);
-        pass[len] = '\0';
-    }
-
-    // Replace '+' with spaces
-    for (char *p = ssid; *p; ++p) if (*p == '+') *p = ' ';
-    for (char *p = pass; *p; ++p) if (*p == '+') *p = ' ';
-
-    ESP_LOGI(TAG, "User selected SSID: '%s'", ssid);
-    ESP_LOGI(TAG, "User entered password: '%s'", pass);
-
-    if (s_save_fn && ssid[0]) {
-        s_save_fn(ssid, pass);
+    // Persist Wi-Fi creds
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("wifi_store", NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        nvs_set_str_checked(h, "ssid",     ssid);
+        nvs_set_str_checked(h, "password", pass);   // unified key name = "password"
+        nvs_commit(h);
+        nvs_close(h);
+    } else {
+        ESP_LOGE(TAG, "nvs_open(wifi_store) failed: %s", esp_err_to_name(err));
     }
 
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, "<html><body><h3>Credentials saved. ESP32 will reconnect.</h3></body></html>");
+    // Persist MQTT settings
+    err = nvs_open("mqtt_store", NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        nvs_set_str_checked(h, "uri",  uri);
+        nvs_set_str_checked(h, "user", user);
+        nvs_set_str_checked(h, "pass", mpass);
+        nvs_commit(h);
+        nvs_close(h);
+    } else {
+        ESP_LOGE(TAG, "nvs_open(mqtt_store) failed: %s", esp_err_to_name(err));
+    }
 
-    free(buf);
-    ESP_LOGI(TAG, "Heap after POST response: %u", esp_get_free_heap_size());
+    // Respond and reboot
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req, "<!doctype html><html><body><h3>Saved. Rebooting…</h3></body></html>");
+
+    free(body);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
     return ESP_OK;
 }
 
-/* Start server */
-esp_err_t web_server_start(void (*save_fn)(const char *, const char *))
+/* ============================================================
+ *                      Server lifecycle API
+ * ============================================================*/
+
+esp_err_t web_server_start(void)
 {
     if (s_server) {
         ESP_LOGW(TAG, "Web server already running");
         return ESP_OK;
     }
 
-    s_save_fn = save_fn;
-
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
+    config.lru_purge_enable = true; // reclaim handlers under memory pressure
     config.server_port = 80;
 
     ESP_LOGI(TAG, "Starting web server on port %d", config.server_port);
     esp_err_t ret = httpd_start(&s_server, &config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Error starting server: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(ret));
         s_server = NULL;
         return ret;
     }
 
-    httpd_uri_t root_uri = {
-        .uri      = "/",
-        .method   = HTTP_GET,
-        .handler  = root_get_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(s_server, &root_uri);
-
-    httpd_uri_t submit_uri = {
-        .uri      = "/submit",
-        .method   = HTTP_POST,
-        .handler  = submit_post_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(s_server, &submit_uri);
-
+    const httpd_uri_t root   = { .uri="/",       .method=HTTP_GET,  .handler=root_get_handler,   .user_ctx=NULL };
+    const httpd_uri_t submit = { .uri="/submit", .method=HTTP_POST, .handler=submit_post_handler, .user_ctx=NULL };
+    httpd_register_uri_handler(s_server, &root);
+    httpd_register_uri_handler(s_server, &submit);
     return ESP_OK;
 }
 
-/* Stop server */
 void web_server_stop(void)
 {
     if (s_server) {
-        ESP_LOGI(TAG, "Stopping web server");
         httpd_stop(s_server);
         s_server = NULL;
+        ESP_LOGI(TAG, "Web server stopped");
     }
 }
+/* ============================================================
+ *                           End
+ * ============================================================*/

@@ -1,28 +1,23 @@
-#ifndef APP_SHARED_H
-#define APP_SHARED_H
+// File: components/app_shared/include/app_shared.h
+#pragma once
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "driver/gpio.h"
-#include "mqtt_client.h"
-
-// Event passed from debounce.c → main.c via gpio_event_queue
+// Event sent from debounce (producer) to the GPIO/MQTT task (consumer)
 typedef struct {
-    gpio_num_t pin;     // GPIO number
-    int        level;   // 0 = LOW, 1 = HIGH
-    const char *topic;  // MQTT topic for this pin
+    gpio_num_t  pin;          // GPIO number
+    int         level;        // 0 or 1
+    const char *topic;        // MQTT topic (pointer must stay valid)
 } gpio_event_t;
 
-// Global handles (DEFINED exactly once in main.c)
-extern QueueHandle_t            gpio_event_queue;
-extern esp_mqtt_client_handle_t mqtt_client;
+// Global event queue owned by main.c (defined exactly once in main.c)
+extern QueueHandle_t gpio_event_queue;
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif // APP_SHARED_H
