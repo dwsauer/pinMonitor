@@ -1,0 +1,22 @@
+# File: main/Kconfig.projbuild
+menu "PinMonitor"
+
+config PINMON_ERASE_WIFI_ON_BOOT
+    bool "Erase Wi-Fi credentials at boot (for testing)"
+    default n
+
+config PINMON_DEFAULT_DEBOUNCE_US
+    int "Default debounce window (µs)"
+    range 1000 1000000
+    default 50000
+
+config PINMON_DEFAULT_REPORT_HIGH
+    bool "Default report level HIGH (emit on final HIGH)"
+    default y
+
+config PINMON_MAX_DEBOUNCE_PINS
+    int "Max debounced pins"
+    range 1 32
+    default 10
+
+endmenu
